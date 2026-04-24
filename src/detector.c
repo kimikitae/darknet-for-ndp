@@ -1,4 +1,18 @@
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+ 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/nvme_ioctl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+
+#include "image.h"
+
 #include "darknet.h"
 #include "network.h"
 #include "region_layer.h"
@@ -8,6 +22,17 @@
 #include "box.h"
 #include "demo.h"
 #include "option_list.h"
+
+#define NDP_BLOCK_SIZE       4096
+#define NDP_MAX_EXTENTS      128
+
+#define NDP_NVME_TIMEOUT_MS  120000   /* 120 초 */
+
+typedef struct {
+    uint32_t count;
+    uint64_t lba[NDP_MAX_EXTENTS];
+    uint64_t blk[NDP_MAX_EXTENTS];   /* block count (4 KiB 단위) */
+} ndp_extent_table_t;
 
 #ifndef __COMPAR_FN_T
 #define __COMPAR_FN_T
@@ -1625,6 +1650,8 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
     int names_size = 0;
     char **names = get_labels_custom(name_list, &names_size); //get_labels(name_list);
 
+    double time = what_time_is_it_now();
+
     image **alphabet = load_alphabet();
     network net = parse_network_cfg_custom(cfgfile, 1, 1); // set batch=1
     if (weightfile) {
@@ -1671,8 +1698,15 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
         //image sized = load_image_resize(input, net.w, net.h, net.c, &im);
         image im = load_image(input, 0, 0, net.c);
         image sized;
+
+        double load_time = (what_time_is_it_now() - time);
+        printf("Loaded: %lf seconds", load_time);;
+
         if(letter_box) sized = letterbox_image(im, net.w, net.h);
         else sized = resize_image(im, net.w, net.h);
+
+        double resize_time = (what_time_is_it_now() - time);
+        printf("Resize: %lf seconds", resize_time);;
 
         layer l = net.layers[net.n - 1];
         int k;
@@ -1936,6 +1970,478 @@ void draw_object(char *datacfg, char *cfgfile, char *weightfile, char *filename,
 
     free_network(net);
 }
+
+static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
+{
+    /* fiemap 구조체를 스택에 통째로 올리면 VLA 위험 → heap 할당 */
+    size_t fm_sz = sizeof(struct fiemap)
+                 + NDP_MAX_EXTENTS * sizeof(struct fiemap_extent);
+    struct fiemap *fm = (struct fiemap *)calloc(1, fm_sz);
+    if (!fm) {
+        fprintf(stderr, "[NDP] calloc for fiemap failed\n");
+        return -1;
+    }
+ 
+    fm->fm_length       = FIEMAP_MAX_OFFSET;
+    fm->fm_extent_count = NDP_MAX_EXTENTS;
+ 
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        perror("[NDP] open (fiemap)");
+        free(fm);
+        return -1;
+    }
+    if (ioctl(fd, FS_IOC_FIEMAP, fm) < 0) {
+        perror("[NDP] FS_IOC_FIEMAP");
+        close(fd);
+        free(fm);
+        return -1;
+    }
+    close(fd);
+ 
+    uint32_t n = fm->fm_mapped_extents;
+    if (n == 0) {
+        fprintf(stderr, "[NDP] No extents found for: %s\n", filepath);
+        free(fm);
+        return -1;
+    }
+    if (n > NDP_MAX_EXTENTS) {
+        fprintf(stderr, "[NDP] Warning: extent count %u > max %d, truncating\n",
+                n, NDP_MAX_EXTENTS);
+        n = NDP_MAX_EXTENTS;
+    }
+ 
+    for (uint32_t i = 0; i < n; i++) {
+        out->lba[i] = fm->fm_extents[i].fe_physical / NDP_BLOCK_SIZE;
+        out->blk[i] = fm->fm_extents[i].fe_length   / NDP_BLOCK_SIZE;
+    }
+    out->count = n;
+ 
+    free(fm);
+    return 0;
+}
+ 
+/* ══════════════════════════════════════════════════════════════
+ * 0xC0: NDP 디코딩+샘플링 트리거
+ *
+ * 타겟은 이 명령을 수신하면:
+ *   ① bdev read (ASYNC) → ② preprocess_video_yolo CB 실행
+ *   ③ FFmpeg 디코딩 + 1/10 샘플링 → full_video_buffer 저장
+ *   ④ spdk_nvmf_request_complete() 호출 → CQE 전송
+ *
+ * ioctl은 ④ 시점에 리턴하므로 host 쪽에서 별도 폴링 불필요 (자연 동기화).
+ * cdw0(result) = g_total_frames * per_frame_size (전체 YUV 버퍼 크기)
+ * ══════════════════════════════════════════════════════════════ */
+ 
+static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
+                         uint32_t *total_yuv_size_out)
+{
+    /* ① fiemap */
+    ndp_extent_table_t ext = {0};
+    if (ndp_get_extents(mp4_path, &ext) < 0)
+        return -1;
+ 
+    printf("[NDP] 0xC0: %u extents for %s\n", ext.count, mp4_path);
+    for (uint32_t i = 0; i < ext.count; i++)
+        printf("      [%u] LBA=%-12llu blocks=%llu\n", i,
+               (unsigned long long)ext.lba[i],
+               (unsigned long long)ext.blk[i]);
+ 
+    /* ② extent 테이블 직렬화: [lba0, blk0, lba1, blk1, ...] */
+    size_t tbl_bytes = (size_t)ext.count * 2 * sizeof(uint64_t);
+    /* DMA용 4 KiB 정렬 */
+    size_t buf_bytes = (tbl_bytes + 4095) & ~(size_t)4095;
+ 
+    void *tbl = aligned_alloc(4096, buf_bytes);
+    if (!tbl) {
+        fprintf(stderr, "[NDP] aligned_alloc failed (%zu bytes)\n", buf_bytes);
+        return -1;
+    }
+    memset(tbl, 0, buf_bytes);
+    uint64_t *u64 = (uint64_t *)tbl;
+    for (uint32_t i = 0; i < ext.count; i++) {
+        u64[2 * i]     = ext.lba[i];
+        u64[2 * i + 1] = ext.blk[i];
+    }
+ 
+    /* ③ admin passthru */
+    struct nvme_passthru_cmd cmd = {
+        .opcode     = 0xC0,
+        .flags      = 0,
+        .nsid       = 1,
+        .addr       = (uint64_t)(uintptr_t)tbl,
+        .data_len   = (uint32_t)buf_bytes,
+        .cdw10      = ext.count,       /* 타겟이 extents_count로 파싱 */
+        .timeout_ms = NDP_NVME_TIMEOUT_MS,
+    };
+ 
+    printf("[NDP] Sending 0xC0 (data_len=%zu, cdw10=%u) ...\n",
+           buf_bytes, ext.count);
+    fflush(stdout);
+ 
+    int ret = ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &cmd);
+    free(tbl);
+ 
+    if (ret != 0) {
+        fprintf(stderr, "[NDP] 0xC0 ioctl error: ret=%d errno=%d (%s)\n",
+                ret, errno, strerror(errno));
+        return -1;
+    }
+ 
+    /* cdw0 = g_total_frames * per_frame_size */
+    uint32_t total = cmd.result;
+    printf("[NDP] 0xC0 done: cdw0=%u bytes\n", total);
+ 
+    if (total_yuv_size_out) *total_yuv_size_out = total;
+    return 0;
+}
+ 
+/* ══════════════════════════════════════════════════════════════
+ * 0xC2: 샘플링된 YUV 프레임 전체 fetch
+ *
+ * 타겟은 full_video_buffer의 내용을 iov에 복사 후 버퍼 해제.
+ * cdw0(result) = per_frame_size (한 프레임의 바이트 수).
+ *
+ * [선행 조건]
+ *   ctrlr_bdev.c의 nvmf_bdev_ctrlr_custom_get_result_cmd() 내부
+ *   video_data_remaining 을 반드시 아래와 같이 수정해야 함:
+ *     기존: uint32_t video_data_remaining = frame_size;
+ *     수정: uint32_t video_data_remaining = g_total_frames * frame_size;
+ * ══════════════════════════════════════════════════════════════ */
+ 
+static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes,
+                         uint32_t *per_frame_size_out)
+{
+    /* NVMe 전송 크기는 4 바이트 배수여야 함 */
+    uint32_t mdts_limit = 2 * 1024 * 1024;
+    uint32_t aligned = (total_bytes + 3) & ~3u;
+    uint32_t offset = 0;
+
+    while (offset < total_bytes) {
+        uint32_t current_len = (total_bytes - offset > mdts_limit) ? mdts_limit : (total_bytes - offset);
+
+        struct nvme_passthru_cmd cmd = {
+            .opcode     = 0xC2,
+            .nsid       = 1,
+            .addr       = (uint64_t)(uintptr_t)((uint8_t*)buf + offset),
+            .data_len   = current_len,
+            .cdw10      = offset, // 타겟에게 데이터의 시작 위치(오프셋)를 전달
+            .timeout_ms = NDP_NVME_TIMEOUT_MS,
+        };
+
+        int ret = ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &cmd);
+        if (ret != 0) {
+            fprintf(stderr, "[NDP] 0xC2 ioctl error: ret=%d errno=%d (%s)\n",
+                    ret, errno, strerror(errno));
+            return -1;
+        }
+
+        offset += current_len;
+
+        if (per_frame_size_out) *per_frame_size_out = cmd.result;
+        // printf("[NDP] 0xC2 done: cdw0= %u(w) X %u(h) = %u (per-frame size)\n", cmd.result >> 16, cmd.result & 0xFFFF, cmd.result);
+    }
+ 
+    // struct nvme_passthru_cmd cmd = {
+    //     .opcode     = 0xC2,
+    //     .flags      = 0,
+    //     .nsid       = 1,
+    //     .addr       = (uint64_t)(uintptr_t)buf,
+    //     .data_len   = aligned,
+    //     .timeout_ms = NDP_NVME_TIMEOUT_MS,
+    // };
+ 
+    // printf("[NDP] Sending 0xC2 (data_len=%u) ...\n", aligned);
+    // fflush(stdout);
+    return 0;
+}
+ 
+/* ══════════════════════════════════════════════════════════════
+ * YUV420P → darknet float image (RGB, CHW 레이아웃, [0, 1])
+ *
+ * 레이아웃:
+ *   Y: [0 .. w*h)
+ *   U: [w*h .. w*h + (w/2)*(h/2))
+ *   V: [w*h + (w/2)*(h/2) .. w*h*3/2)
+ * ══════════════════════════════════════════════════════════════ */
+ 
+static image ndp_yuv420p_to_image(const uint8_t *yuv, int w, int h)
+{
+    image im = make_image(w, h, 3);
+ 
+    int uv_stride = w / 2;
+    int uv_offset = w * h;
+ 
+    for (int row = 0; row < h; row++) {
+        for (int col = 0; col < w; col++) {
+            int Y = (int)(uint8_t)yuv[row * w + col];
+            int U = (int)(uint8_t)yuv[uv_offset
+                                      + (row / 2) * uv_stride
+                                      + col / 2]   - 128;
+            int V = (int)(uint8_t)yuv[uv_offset
+                                      + (h / 2) * uv_stride
+                                      + (row / 2) * uv_stride
+                                      + col / 2]   - 128;
+ 
+            /* BT.601 YCbCr → RGB (integer 근사) */
+            int R = Y + ((int)(1.402f  * (float)V));
+            int G = Y - ((int)(0.344f  * (float)U))
+                      - ((int)(0.714f  * (float)V));
+            int B = Y + ((int)(1.772f  * (float)U));
+ 
+            R = R < 0 ? 0 : (R > 255 ? 255 : R);
+            G = G < 0 ? 0 : (G > 255 ? 255 : G);
+            B = B < 0 ? 0 : (B > 255 ? 255 : B);
+ 
+            /* darknet image: data[c * h * w + row * w + col] */
+            im.data[0 * w * h + row * w + col] = (float)R / 255.0f;
+            im.data[1 * w * h + row * w + col] = (float)G / 255.0f;
+            im.data[2 * w * h + row * w + col] = (float)B / 255.0f;
+        }
+    }
+    return im;
+}
+ 
+/* ══════════════════════════════════════════════════════════════
+ * 공개 함수: ndp_test_detector
+ *
+ * detector.c의 run_detector()에서 "ndp_test" 서브커맨드로 호출.
+ * 헤더 선언은 demo.h 또는 별도 ndp_detector.h에 추가 필요:
+ *   void ndp_test_detector(char*, char*, char*, char*, char*,
+ *                          float, float, int, int, char*, int, int);
+ * ══════════════════════════════════════════════════════════════ */
+ 
+void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
+                       char *nvme_dev, char *mp4_path,
+                       float thresh, float hier_thresh,
+                       int dont_show, int ext_output, char *outfile,
+                       int letter_box, int benchmark_layers)
+{
+    /* ── 1. darknet 네트워크 로딩 ─────────────────────────── */
+    list *options    = read_data_cfg(datacfg);
+    char *name_list  = option_find_str(options, "names", "data/names.list");
+    int   names_size = 0;
+    char **names     = get_labels_custom(name_list, &names_size);
+    image **alphabet = load_alphabet();
+
+    double time = what_time_is_it_now();
+ 
+    network net = parse_network_cfg_custom(cfgfile, 1, 1);  /* batch=1 */
+    if (weightfile) load_weights(&net, weightfile);
+    if (net.letter_box) letter_box = 1;
+    net.benchmark_layers = benchmark_layers;
+    fuse_conv_batchnorm(net);
+    calculate_binary_weights(net);
+    srand(2222222);
+ 
+    /* 마지막 detection layer 찾기 */
+    layer l = net.layers[net.n - 1];
+    for (int k = 0; k < net.n; k++) {
+        layer lk = net.layers[k];
+        if (lk.type == YOLO || lk.type == GAUSSIAN_YOLO || lk.type == REGION)
+            l = lk;
+    }
+ 
+    if (l.classes != names_size) {
+        fprintf(stderr, "[NDP] Warning: cfg classes=%d but names=%d\n",
+                l.classes, names_size);
+    }
+ 
+    /* ── 2. NVMe 디바이스 열기 ───────────────────────────── */
+    int nvme_fd = open(nvme_dev, O_RDWR);
+    if (nvme_fd < 0) {
+        fprintf(stderr, "[NDP] Cannot open NVMe device %s: %s\n",
+                nvme_dev, strerror(errno));
+        goto cleanup_net;
+    }
+    printf("[NDP] Opened NVMe device: %s\n", nvme_dev);
+ 
+    /* ── 3. 0xC0: NDP 디코딩 + 샘플링 트리거 ────────────── */
+    /*
+     * ioctl은 타겟의 preprocess_video_yolo() 완료 시점까지 블록킹.
+     * 타겟: SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS 리턴 후
+     *       spdk_nvmf_request_complete() 호출 → CQE 전송 → ioctl 리턴.
+     * cdw0(result) = g_total_frames * per_frame_size
+     */
+    uint32_t total_float_size = 0;
+    if (ndp_send_0xc0(nvme_fd, mp4_path, &total_float_size) < 0)
+        goto cleanup_fd;
+ 
+    if (total_float_size == 0) {
+        fprintf(stderr, "[NDP] Target returned 0 bytes. "
+                        "Check g_total_frames on target side.\n");
+        goto cleanup_fd;
+    }
+
+    double ndp_decoding_time = (what_time_is_it_now() - time);
+        printf("ndp_decoding_time: %lf seconds\n", ndp_decoding_time);
+ 
+    /* ── 4. 0xC2: YUV 버퍼 전체 fetch ───────────────────── */
+    /*
+     * 타겟 side 주의: nvmf_bdev_ctrlr_custom_get_result_cmd() 에서
+     *   video_data_remaining = g_total_frames * frame_size;  ← 이렇게 수정 필요
+     * 기존 코드(= frame_size)는 1프레임만 복사하고 버퍼를 해제하므로
+     * 멀티프레임 샘플링 시 데이터 유실 발생.
+     */
+    size_t alloc_bytes = ((size_t)total_float_size + 4095) & ~(size_t)4095;
+    float *float_buf   = (float *)aligned_alloc(4096, alloc_bytes);
+    fprintf(stdout, "[NDP] alloc %zu bytes\n", alloc_bytes);
+    if (!float_buf) {
+        fprintf(stderr, "[NDP] Failed to alloc %zu bytes\n", alloc_bytes);
+        goto cleanup_fd;
+    }
+    memset(float_buf, 0, alloc_bytes);
+ 
+    uint32_t per_frame_size= 0;
+    
+    if (ndp_send_0xc2(nvme_fd, float_buf, total_float_size, &per_frame_size) < 0)
+        goto cleanup_float;
+
+
+    double get_result_time = (what_time_is_it_now() - time);
+        printf("get_result_time: %lf seconds\n", get_result_time);
+    // YUV420이면 channels 1.5 (Y=1, U=0.25, V=0.25)로 간주(하드코딩)하여 프레임 수 계산에 활용
+    uint32_t frame_width = per_frame_size >> 16, frame_height = per_frame_size & 0xFFFF, frame_channels = 3;
+    per_frame_size = (uint32_t)(frame_width * frame_height * 3 * sizeof(float));
+ 
+    /* per_frame_size 체크 */
+    if (per_frame_size == 0) {
+        fprintf(stderr, "[NDP] cdw0=0, unexpected per_frame_size=%u\n",
+                per_frame_size);
+        return -1;
+    }
+    /* 프레임 수 계산 (타겟 cdw0 기준) */
+    uint32_t num_frames = total_float_size / per_frame_size;
+    printf("[NDP] Per-frame size: %u(w) X %u(h) = %u bytes  Final frame count: %u\n",
+           frame_width, frame_height, per_frame_size, num_frames);
+ 
+    /* ── 5. JSON 출력 파일 준비 ──────────────────────────── */
+    FILE *json_file = NULL;
+    char *json_buf  = NULL;
+    int   json_id   = 0;
+    if (outfile) {
+        json_file = fopen(outfile, "wb");
+        if (!json_file) {
+            fprintf(stderr, "[NDP] Cannot open outfile: %s\n", outfile);
+        } else {
+            fwrite("[\n", 1, 2, json_file);
+        }
+    }
+ 
+    /* ── 6. 프레임별 추론 루프 ───────────────────────────── */
+    const float nms = 0.45f;
+
+    double time2 = what_time_is_it_now();
+        
+    for (uint32_t fi = 0; fi < num_frames; fi++) {
+        // const uint8_t *frame_yuv = yuv_buf + (size_t)fi * per_frame_size;
+
+        /* YUV420P (w×h) → darknet float image */
+        //image im_orig = ndp_yuv420p_to_image(frame_yuv, frame_width, frame_height);
+
+        // if(time2 != 0){
+        //     double yuv2rgb_time = (what_time_is_it_now() - time2);
+        //     printf("yuv2rgb_time: %lf seconds", yuv2rgb_time);   
+        // }
+
+        /* 네트워크 입력 크기로 리사이즈 */
+        // image im_input = letter_box
+        //     ? letterbox_image(im_orig, net.w, net.h)
+        //     : resize_image(im_orig, net.w, net.h);
+
+        // if(time2 != 0){
+        //     double resize_time = (what_time_is_it_now() - time2);
+        //     printf("resize_time: %lf seconds \n", resize_time);   
+        //     time2 = 0;
+        // }
+
+        image im_input;
+        im_input.w = frame_width;
+        im_input.h = frame_height;
+        im_input.c = 3;
+        im_input.data = float_buf + (fi * frame_width * frame_height * 3);
+ 
+        /* 추론 */
+        double t0 = get_time_point();
+        network_predict(net, im_input.data);
+        printf("[NDP] Frame %u/%u: predicted in %.1f ms\n",
+               fi + 1, num_frames,
+               (get_time_point() - t0) / 1000.0);
+ 
+        /* 검출 결과 */
+        int nboxes = 0;
+        detection *dets = get_network_boxes(
+            &net, im_input.w, im_input.h,
+            thresh, hier_thresh, 0, 1, &nboxes, letter_box);
+ 
+        if (nms) {
+            if (l.nms_kind == DEFAULT_NMS)
+                do_nms_sort(dets, nboxes, l.classes, nms);
+            else
+                diounms_sort(dets, nboxes, l.classes, nms,
+                             l.nms_kind, l.beta_nms);
+        }
+ 
+        /* 바운딩 박스 오버레이 */
+        draw_detections_v3(im_input, dets, nboxes, thresh,
+                           names, alphabet, l.classes, ext_output);
+ 
+        /* 결과 이미지 저장 (ndp_frame_0000.jpg, ...) */
+        char save_name[64];
+        snprintf(save_name, sizeof(save_name), "ndp_frame_%04u", fi);
+        save_image(im_input, save_name);
+        printf("[NDP] Saved: %s.jpg (%d detections)\n", save_name, nboxes);
+ 
+        /* 첫 프레임만 화면 표시 (dont_show 옵션 아닌 경우) */
+        if (!dont_show && fi == 0) {
+            show_image(im_input, "NDP Detection - first sampled frame");
+        }
+ 
+        /* JSON 기록 */
+        if (json_file) {
+            if (json_buf) fwrite(", \n", 1, 3, json_file);
+            ++json_id;
+            json_buf = detection_to_json(dets, nboxes, l.classes,
+                                         names, json_id, save_name);
+            fwrite(json_buf, 1, strlen(json_buf), json_file);
+            free(json_buf);
+            json_buf = NULL;
+        }
+ 
+        free_detections(dets, nboxes);
+        // free_image(im_orig);
+        // free_image(im_input);
+    }
+ 
+    /* ── 7. 정리 ─────────────────────────────────────────── */
+    if (json_file) {
+        fwrite("\n]", 1, 2, json_file);
+        fclose(json_file);
+        printf("[NDP] JSON results written to: %s\n", outfile);
+    }
+    if (!dont_show) {
+        wait_until_press_key_cv();
+        destroy_all_windows_cv();
+    }
+    printf("[NDP] Done. Processed %u/%u sampled frames from %s\n",
+           num_frames, num_frames, mp4_path);
+ 
+cleanup_float:
+    free(float_buf);
+cleanup_fd:
+    close(nvme_fd);
+cleanup_net:
+    free_ptrs((void **)names, net.layers[net.n - 1].classes);
+    free_list_contents_kvp(options);
+    free_list(options);
+    free_alphabet(alphabet);
+    free_network(net);
+
+    double total_time = (what_time_is_it_now() - time);
+            printf("total_time: %lf seconds \n", total_time);   
+}
+
+
 #else // defined(OPENCV) && defined(GPU)
 void draw_object(char *datacfg, char *cfgfile, char *weightfile, char *filename, float thresh, int dont_show, int it_num,
     int letter_box, int benchmark_layers)
@@ -2027,6 +2533,13 @@ void run_detector(int argc, char **argv)
     else if (0 == strcmp(argv[2], "draw")) {
         int it_num = 100;
         draw_object(datacfg, cfg, weights, filename, thresh, dont_show, it_num, letter_box, benchmark_layers);
+    }
+    else if (0 == strcmp(argv[2], "ndp_test")) {
+        char *nvme_dev = find_char_arg(argc, argv, "-dev", "/dev/nvme1n1");
+        char *mp4_path = find_char_arg(argc, argv, "-file", NULL);
+        ndp_test_detector(datacfg, cfg, weights, nvme_dev, mp4_path,
+                        thresh, hier_thresh, dont_show, ext_output,
+                        outfile, letter_box, benchmark_layers);
     }
     else if (0 == strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);

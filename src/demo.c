@@ -159,6 +159,9 @@ void demo(char *cfgfile, char *weightfile, float thresh, float hier_thresh, int 
     char *json_buf = NULL;
     FILE* json_file = NULL;
 
+    double time = what_time_is_it_now();
+
+
     if (json_file_output) {
         json_file = fopen(json_file_output, "wb");
         char *tmp = "[\n";
@@ -438,6 +441,9 @@ void demo(char *cfgfile, char *weightfile, float thresh, float hier_thresh, int 
     free_alphabet(alphabet);
     free_network(net);
     //cudaProfilerStop();
+
+    double total_time = (what_time_is_it_now() - time);
+            printf("total_time: %lf seconds\n", total_time);   
 }
 #else
 void demo(char *cfgfile, char *weightfile, float thresh, float hier_thresh, int cam_index, const char *filename, char **names, int classes, int avgframes,
