@@ -22,6 +22,7 @@
 #include "box.h"
 #include "demo.h"
 #include "option_list.h"
+#include "image_opencv.h"
 
 #define NDP_BLOCK_SIZE       4096
 #define NDP_MAX_EXTENTS      128
@@ -2097,20 +2098,21 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
 }
  
 /* ══════════════════════════════════════════════════════════════
- * 0xC2: 샘플링된 YUV 프레임 전체 fetch
+ * 0xC2: 전처리 결과 버퍼 전체 fetch
  *
- * 타겟은 full_video_buffer의 내용을 iov에 복사 후 버퍼 해제.
- * cdw0(result) = per_frame_size (한 프레임의 바이트 수).
+ * 타겟(ctrlr_bdev.c: ndp_preprocess_worker)이 만드는 버퍼 구조:
+ *   [uint32 frame_count]
+ *   [uint32 jpeg_size × frame_count]
+ *   [JPEG blob × frame_count]
+ * 즉 프레임 크기가 가변이므로 per_frame_size 개념이 없다.
+ * 프레임 수와 각 프레임 크기는 버퍼 헤더에서 읽는다.
  *
- * [선행 조건]
- *   ctrlr_bdev.c의 nvmf_bdev_ctrlr_custom_get_result_cmd() 내부
- *   video_data_remaining 을 반드시 아래와 같이 수정해야 함:
- *     기존: uint32_t video_data_remaining = frame_size;
- *     수정: uint32_t video_data_remaining = g_total_frames * frame_size;
+ * 전체 바이트 수는 0xC0의 cdw0으로 이미 받았고,
+ * 타겟은 cdw10(offset) 기준으로 청크를 채운 뒤
+ * 마지막 청크에서 버퍼를 해제한다.
  * ══════════════════════════════════════════════════════════════ */
  
-static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes,
-                         uint32_t *per_frame_size_out)
+static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes)
 {
     /* NVMe 전송 크기는 4 바이트 배수여야 함 */
     uint32_t mdts_limit = 2 * 1024 * 1024;
@@ -2137,9 +2139,6 @@ static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes,
         }
 
         offset += current_len;
-
-        if (per_frame_size_out) *per_frame_size_out = cmd.result;
-        // printf("[NDP] 0xC2 done: cdw0= %u(w) X %u(h) = %u (per-frame size)\n", cmd.result >> 16, cmd.result & 0xFFFF, cmd.result);
     }
  
     // struct nvme_passthru_cmd cmd = {
@@ -2263,11 +2262,11 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
      *       spdk_nvmf_request_complete() 호출 → CQE 전송 → ioctl 리턴.
      * cdw0(result) = g_total_frames * per_frame_size
      */
-    uint32_t total_float_size = 0;
-    if (ndp_send_0xc0(nvme_fd, mp4_path, &total_float_size) < 0)
+    uint32_t total_result_size = 0;
+    if (ndp_send_0xc0(nvme_fd, mp4_path, &total_result_size) < 0)
         goto cleanup_fd;
  
-    if (total_float_size == 0) {
+    if (total_result_size == 0) {
         fprintf(stderr, "[NDP] Target returned 0 bytes. "
                         "Check g_total_frames on target side.\n");
         goto cleanup_fd;
@@ -2276,44 +2275,49 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
     double ndp_decoding_time = (what_time_is_it_now() - time);
         printf("ndp_decoding_time: %lf seconds\n", ndp_decoding_time);
  
-    /* ── 4. 0xC2: YUV 버퍼 전체 fetch ───────────────────── */
-    /*
-     * 타겟 side 주의: nvmf_bdev_ctrlr_custom_get_result_cmd() 에서
-     *   video_data_remaining = g_total_frames * frame_size;  ← 이렇게 수정 필요
-     * 기존 코드(= frame_size)는 1프레임만 복사하고 버퍼를 해제하므로
-     * 멀티프레임 샘플링 시 데이터 유실 발생.
-     */
-    size_t alloc_bytes = ((size_t)total_float_size + 4095) & ~(size_t)4095;
-    float *float_buf   = (float *)aligned_alloc(4096, alloc_bytes);
+    /* ── 4. 0xC2: 전처리 결과 버퍼 전체 fetch ───────────── */
+    size_t alloc_bytes  = ((size_t)total_result_size + 4095) & ~(size_t)4095;
+    uint8_t *result_buf = (uint8_t *)aligned_alloc(4096, alloc_bytes);
     fprintf(stdout, "[NDP] alloc %zu bytes\n", alloc_bytes);
-    if (!float_buf) {
+    if (!result_buf) {
         fprintf(stderr, "[NDP] Failed to alloc %zu bytes\n", alloc_bytes);
         goto cleanup_fd;
     }
-    memset(float_buf, 0, alloc_bytes);
- 
-    uint32_t per_frame_size= 0;
-    
-    if (ndp_send_0xc2(nvme_fd, float_buf, total_float_size, &per_frame_size) < 0)
-        goto cleanup_float;
+    memset(result_buf, 0, alloc_bytes);
 
+    if (ndp_send_0xc2(nvme_fd, result_buf, total_result_size) < 0)
+        goto cleanup_buf;
 
     double get_result_time = (what_time_is_it_now() - time);
         printf("get_result_time: %lf seconds\n", get_result_time);
-    // YUV420이면 channels 1.5 (Y=1, U=0.25, V=0.25)로 간주(하드코딩)하여 프레임 수 계산에 활용
-    uint32_t frame_width = per_frame_size >> 16, frame_height = per_frame_size & 0xFFFF, frame_channels = 3;
-    per_frame_size = (uint32_t)(frame_width * frame_height * 3 * sizeof(float));
- 
-    /* per_frame_size 체크 */
-    if (per_frame_size == 0) {
-        fprintf(stderr, "[NDP] cdw0=0, unexpected per_frame_size=%u\n",
-                per_frame_size);
-        return -1;
+
+    /* ── 4-1. 결과 헤더 파싱 ─────────────────────────────
+     *   [uint32 frame_count][uint32 jpeg_size × N][JPEG blob × N]
+     */
+    uint32_t num_frames = 0;
+    memcpy(&num_frames, result_buf, sizeof(uint32_t));
+
+    size_t header_bytes = (size_t)(1 + num_frames) * sizeof(uint32_t);
+    if (num_frames == 0 || header_bytes > (size_t)total_result_size) {
+        fprintf(stderr, "[NDP] Invalid result header: frame_count=%u, "
+                        "total=%u bytes\n", num_frames, total_result_size);
+        goto cleanup_buf;
     }
-    /* 프레임 수 계산 (타겟 cdw0 기준) */
-    uint32_t num_frames = total_float_size / per_frame_size;
-    printf("[NDP] Per-frame size: %u(w) X %u(h) = %u bytes  Final frame count: %u\n",
-           frame_width, frame_height, per_frame_size, num_frames);
+
+    const uint32_t *jpeg_sizes = (const uint32_t *)(result_buf + sizeof(uint32_t));
+    const uint8_t  *blob_base  = result_buf + header_bytes;
+
+    size_t blob_total = 0;
+    for (uint32_t i = 0; i < num_frames; i++) blob_total += jpeg_sizes[i];
+    if (header_bytes + blob_total > (size_t)total_result_size) {
+        fprintf(stderr, "[NDP] Result size mismatch: header %zu + blobs %zu "
+                        "> total %u\n", header_bytes, blob_total, total_result_size);
+        goto cleanup_buf;
+    }
+
+    printf("[NDP] Frames: %u, JPEG payload: %zu bytes "
+           "(avg %.1f KB/frame)\n",
+           num_frames, blob_total, blob_total / 1024.0 / num_frames);
  
     /* ── 5. JSON 출력 파일 준비 ──────────────────────────── */
     FILE *json_file = NULL;
@@ -2331,35 +2335,29 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
     /* ── 6. 프레임별 추론 루프 ───────────────────────────── */
     const float nms = 0.45f;
 
-    double time2 = what_time_is_it_now();
-        
+    size_t blob_off      = 0;
+    double t_jpegdec_sum = 0.0;
+
     for (uint32_t fi = 0; fi < num_frames; fi++) {
-        // const uint8_t *frame_yuv = yuv_buf + (size_t)fi * per_frame_size;
+        /* storage가 보낸 JPEG(net 크기 letterbox 완료) → darknet image.
+         * 복호화·색변환·letterbox는 이미 storage에서 끝났으므로
+         * host는 JPEG 압축 해제만 수행한다. */
+        double t_dec = what_time_is_it_now();
+        image im_input = ndp_jpeg_to_image(blob_base + blob_off, jpeg_sizes[fi]);
+        t_jpegdec_sum += (what_time_is_it_now() - t_dec);
+        blob_off += jpeg_sizes[fi];
 
-        /* YUV420P (w×h) → darknet float image */
-        //image im_orig = ndp_yuv420p_to_image(frame_yuv, frame_width, frame_height);
-
-        // if(time2 != 0){
-        //     double yuv2rgb_time = (what_time_is_it_now() - time2);
-        //     printf("yuv2rgb_time: %lf seconds", yuv2rgb_time);   
-        // }
-
-        /* 네트워크 입력 크기로 리사이즈 */
-        // image im_input = letter_box
-        //     ? letterbox_image(im_orig, net.w, net.h)
-        //     : resize_image(im_orig, net.w, net.h);
-
-        // if(time2 != 0){
-        //     double resize_time = (what_time_is_it_now() - time2);
-        //     printf("resize_time: %lf seconds \n", resize_time);   
-        //     time2 = 0;
-        // }
-
-        image im_input;
-        im_input.w = frame_width;
-        im_input.h = frame_height;
-        im_input.c = 3;
-        im_input.data = float_buf + (fi * frame_width * frame_height * 3);
+        if (!im_input.data || im_input.w == 0 || im_input.h == 0) {
+            fprintf(stderr, "[NDP] Frame %u: JPEG decode failed, skipped\n", fi);
+            if (im_input.data) free_image(im_input);
+            continue;
+        }
+        if (im_input.w != net.w || im_input.h != net.h) {
+            fprintf(stderr, "[NDP] Frame %u: size %dx%d != net %dx%d\n",
+                    fi, im_input.w, im_input.h, net.w, net.h);
+            free_image(im_input);
+            continue;
+        }
  
         /* 추론 */
         double t0 = get_time_point();
@@ -2409,9 +2407,11 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
         }
  
         free_detections(dets, nboxes);
-        // free_image(im_orig);
-        // free_image(im_input);
+        free_image(im_input);
     }
+
+    printf("[NDP] JPEG decode total: %lf seconds (%.2f ms/frame)\n",
+           t_jpegdec_sum, t_jpegdec_sum * 1000.0 / num_frames);
  
     /* ── 7. 정리 ─────────────────────────────────────────── */
     if (json_file) {
@@ -2426,8 +2426,8 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
     printf("[NDP] Done. Processed %u/%u sampled frames from %s\n",
            num_frames, num_frames, mp4_path);
  
-cleanup_float:
-    free(float_buf);
+cleanup_buf:
+    free(result_buf);
 cleanup_fd:
     close(nvme_fd);
 cleanup_net:

@@ -351,6 +351,30 @@ image mat_to_image_cv(mat_cv *mat)
     return mat_to_image(*(cv::Mat*)mat);
 }
 
+// ----------------------------------------
+// NDP: storage가 반환한 JPEG 바이트열을 darknet image로 변환.
+// load_image_cv()와 동일하게 채널을 뒤집어 RGB 순서로 맞춘다
+// (cv::imdecode는 BGR을 돌려주고 mat_to_image는 순서를 보존하므로
+//  변환하지 않으면 R/B가 뒤바뀌어 검출 결과가 달라진다).
+extern "C" image ndp_jpeg_to_image(const unsigned char *buf, size_t len)
+{
+    try {
+        cv::Mat raw(1, (int)len, CV_8UC1, (void *)buf);
+        cv::Mat mat = cv::imdecode(raw, cv::IMREAD_COLOR);
+        if (mat.empty()) {
+            cerr << "ndp_jpeg_to_image: imdecode failed \n";
+            return make_image(0, 0, 0);
+        }
+        cv::Mat dst;
+        cv::cvtColor(mat, dst, cv::COLOR_BGR2RGB);
+        return mat_to_image(dst);
+    }
+    catch (...) {
+        cerr << "OpenCV exception: ndp_jpeg_to_image \n";
+        return make_image(0, 0, 0);
+    }
+}
+
 // ====================================================================
 // Window
 // ====================================================================

@@ -45,6 +45,9 @@ void release_mat(mat_cv **mat);
 // image mat_to_image(cv::Mat mat)
 image mat_to_image_cv(mat_cv *mat);
 
+// NDP: 인메모리 JPEG 버퍼 → darknet image (RGB, CHW, [0,1])
+image ndp_jpeg_to_image(const unsigned char *buf, size_t len);
+
 // Window
 void create_window_cv(char const* window_name, int full_screen, int width, int height);
 void resize_window_cv(char const* window_name, int width, int height);
