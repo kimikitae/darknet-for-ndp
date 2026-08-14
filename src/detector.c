@@ -50,7 +50,7 @@ typedef struct {
 
 static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out);
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
-                         int sample_rate, int scaler_sel, int jpeg_quality,
+                         int sample_rate, int jpeg_quality,
                          uint32_t *total_result_size_out);
 static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes);
 
@@ -983,7 +983,84 @@ int detections_comparator(const void *pa, const void *pb)
     else if (diff > 0) return -1;
     return 0;
 }
+
+static void vmap_letterbox_geom(int orig_w, int orig_h, int net_w, int net_h,
+                                int *new_w, int *new_h, int *dx, int *dy)
+{
+    if (((float)net_w / orig_w) < ((float)net_h / orig_h)) {
+        *new_w = net_w;
+        *new_h = (orig_h * net_w) / orig_w;
+    } else {
+        *new_h = net_h;
+        *new_w = (orig_w * net_h) / orig_h;
+    }
+    *dx = (net_w - *new_w) / 2;
+    *dy = (net_h - *new_h) / 2;
+}
  
+static void vmap_draw_rect(image im, int x1, int y1, int x2, int y2,
+                           int thick, float r, float g, float b)
+{
+    int i, k, x, y;
+    if (x1 > x2) { i = x1; x1 = x2; x2 = i; }
+    if (y1 > y2) { i = y1; y1 = y2; y2 = i; }
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= im.w) x2 = im.w - 1;
+    if (y2 >= im.h) y2 = im.h - 1;
+    if (x2 < x1 || y2 < y1) return;
+ 
+    const float col[3] = { r, g, b };
+    for (k = 0; k < thick; ++k) {
+        int xa = x1 + k, xb = x2 - k;
+        int ya = y1 + k, yb = y2 - k;
+        if (xa > xb || ya > yb) break;
+        for (x = xa; x <= xb; ++x) {
+            for (i = 0; i < im.c && i < 3; ++i) {
+                im.data[i * im.h * im.w + ya * im.w + x] = col[i];
+                im.data[i * im.h * im.w + yb * im.w + x] = col[i];
+            }
+        }
+        for (y = ya; y <= yb; ++y) {
+            for (i = 0; i < im.c && i < 3; ++i) {
+                im.data[i * im.h * im.w + y * im.w + xa] = col[i];
+                im.data[i * im.h * im.w + y * im.w + xb] = col[i];
+            }
+        }
+    }
+}
+
+static void vmap_overlay(image im, int orig_w, int orig_h,
+                         detection *dets, int nboxes, int classes,
+                         box_label *truth, int num_labels,
+                         float draw_thresh)
+{
+    int new_w, new_h, dx, dy, i, c;
+    vmap_letterbox_geom(orig_w, orig_h, im.w, im.h, &new_w, &new_h, &dx, &dy);
+ 
+    for (i = 0; i < num_labels; ++i) {
+        int x1 = (int)((truth[i].x - truth[i].w / 2) * new_w) + dx;
+        int y1 = (int)((truth[i].y - truth[i].h / 2) * new_h) + dy;
+        int x2 = (int)((truth[i].x + truth[i].w / 2) * new_w) + dx;
+        int y2 = (int)((truth[i].y + truth[i].h / 2) * new_h) + dy;
+        vmap_draw_rect(im, x1, y1, x2, y2, 1, 0.0f, 1.0f, 0.0f);
+    }
+ 
+    for (i = 0; i < nboxes; ++i) {
+        float best = 0;
+        for (c = 0; c < classes; ++c)
+            if (dets[i].prob[c] > best) best = dets[i].prob[c];
+        if (best <= draw_thresh) continue;
+ 
+        box b = dets[i].bbox;
+        int x1 = (int)((b.x - b.w / 2) * new_w) + dx;
+        int y1 = (int)((b.y - b.h / 2) * new_h) + dy;
+        int x2 = (int)((b.x + b.w / 2) * new_w) + dx;
+        int y2 = (int)((b.y + b.h / 2) * new_h) + dy;
+        vmap_draw_rect(im, x1, y1, x2, y2, 2, 1.0f, 0.0f, 0.0f);
+    }
+}
+
 /* One detection, retained across the whole run so that the PR curve can be
  * recomputed at several IoU thresholds without re-running inference. */
 typedef struct {
@@ -1124,7 +1201,8 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                          int use_ndp, int sample_rate, int label_base,
                          float thresh_calc_avg_iou, const float iou_thresh,
                          const int map_points, int coco_range,
-                         int scaler_sel, int jpeg_quality)
+                         int jpeg_quality,
+                         char *save_img_dir, char *save_log_path)
 {
     int i, j;
  
@@ -1167,10 +1245,9 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     }
  
     printf("[MAP][VERIFY] video=%s  orig=%dx%d  cap_frame_count=%d  "
-           "sample_rate=1/%d  mode=%s  scaler_sel=%d  jpeg_q=%d\n",
+           "sample_rate=1/%d  mode=%s  jpeg_q=%d\n",
            video_path, orig_w, orig_h, total_frames, sample_rate,
            use_ndp ? "NDP" : "BASELINE",
-           use_ndp ? scaler_sel : -1,
            use_ndp ? (jpeg_quality ? jpeg_quality : 85) : -1);
     {
         /* Letterbox geometry darknet will assume when inverting box
@@ -1205,7 +1282,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         }
         uint32_t total_result_size = 0;
         if (ndp_send_0xc0(nvme_fd, video_path, sample_rate,
-                          scaler_sel, jpeg_quality, &total_result_size) < 0 ||
+                          jpeg_quality, &total_result_size) < 0 ||
             total_result_size == 0) {
             fprintf(stderr, "[MAP] 0xC0 failed\n");
             close(nvme_fd); release_capture(cap); return 0;
@@ -1276,6 +1353,23 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     int n_present = 0;
     double mean_ap = 0, mean_ap_coco = 0;
  
+    FILE *logfp = NULL;
+    if (save_log_path) {
+        logfp = fopen(save_log_path, "w");
+        if (!logfp) {
+            fprintf(stderr, "[MAP] Cannot open log file %s: %s\n",
+                    save_log_path, strerror(errno));
+        } else {
+            fprintf(logfp, "frame,type,class_id,class_name,confidence,cx,cy,w,h\n");
+        }
+    }
+    if (save_img_dir) {
+        char mkcmd[4200];
+        snprintf(mkcmd, sizeof(mkcmd), "mkdir -p \"%s\"", save_img_dir);
+        if (system(mkcmd) != 0)
+            fprintf(stderr, "[MAP] Warning: cannot create %s\n", save_img_dir);
+    }
+
     time_t start = time(0);
  
     /* ---- frame loop ---- */
@@ -1388,6 +1482,36 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             }
         }
         unique_truth_count += num_labels;
+
+        if (logfp) {
+            const int frame_no = decode_idx + label_base;
+            for (i = 0; i < nboxes; ++i) {
+                int c;
+                for (c = 0; c < classes; ++c) {
+                    if (dets[i].prob[c] <= thresh_calc_avg_iou) continue;
+                    box b = dets[i].bbox;
+                    fprintf(logfp, "%d,det,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                            frame_no, c, names[c], dets[i].prob[c],
+                            b.x, b.y, b.w, b.h);
+                }
+            }
+            for (j = 0; j < num_labels; ++j) {
+                const char *nm = (truth[j].id >= 0 && truth[j].id < classes)
+                               ? names[truth[j].id] : "unknown";
+                fprintf(logfp, "%d,gt,%d,%s,1.000000,%.6f,%.6f,%.6f,%.6f\n",
+                        frame_no, truth[j].id, nm,
+                        truth[j].x, truth[j].y, truth[j].w, truth[j].h);
+            }
+        }
+
+        if (save_img_dir) {
+            vmap_overlay(im_input, orig_w, orig_h, dets, nboxes, classes,
+                         truth, num_labels, thresh_calc_avg_iou);
+            char imgpath[4300];
+            snprintf(imgpath, sizeof(imgpath), "%s/frame_%06d",
+                     save_img_dir, decode_idx + label_base);
+            save_image(im_input, imgpath);
+        }
  
         if ((image_index % 50) == 0)
             fprintf(stderr, "\r[MAP] eval frame %d (video idx %d)   ",
@@ -1523,6 +1647,13 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     fprintf(stderr, "Total Detection Time: %d Seconds\n", (int)(time(0) - start));
  
 cleanup:
+    if (logfp) {
+        fclose(logfp);
+        printf("[MAP] detection log written: %s\n", save_log_path);
+    }
+    if (save_img_dir)
+        printf("[MAP] overlay images written to: %s/\n", save_img_dir);
+
     if (ap_primary)          free(ap_primary);
     if (present_cls)         free(present_cls);
     if (truth_count_present) free(truth_count_present);
@@ -2623,7 +2754,7 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  * Payload : serialised extent table, [lba0, blk0, lba1, blk1, ...]
  * cdw10   : extent count
  * cdw11   : sample rate, keep 1 frame out of N (0 means 1)
- * cdw12   : [7:0] scaler selector, [15:8] JPEG quality (0 means target default)
+ * cdw12   : [7:0] JPEG quality 1-100 (0 means target default of 85)
  * cdw0    : (response) total byte size of the result buffer
  *
  * The ioctl blocks until the target's worker thread has finished the entire
@@ -2631,10 +2762,9 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  *
  * Result buffer layout produced by the target:
  *   [uint32 frame_count][uint32 jpeg_size x N][JPEG blob x N]
- * Frame sizes vary, hence the explicit size table instead of a fixed stride.
  */
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
-                         int sample_rate, int scaler_sel, int jpeg_quality,
+                         int sample_rate, int jpeg_quality,
                          uint32_t *total_result_size_out)
 {
     ndp_extent_table_t ext = {0};
@@ -2662,8 +2792,7 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
         u64[2 * i + 1] = ext.blk[i];
     }
  
-    uint32_t cdw12 = ((uint32_t)(scaler_sel   & 0xFF))
-                   | ((uint32_t)(jpeg_quality & 0xFF) << 8);
+    uint32_t cdw12 = (uint32_t)(jpeg_quality & 0xFF);
  
     struct nvme_passthru_cmd cmd = {
         .opcode     = 0xC0,
@@ -2672,14 +2801,14 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
         .addr       = (uint64_t)(uintptr_t)tbl,
         .data_len   = (uint32_t)buf_bytes,
         .cdw10      = ext.count,
-        .cdw11      = (uint32_t)(sample_rate & 0xFFFF),
-        .cdw12      = cdw12,
+        .cdw11      = (uint32_t)(sample_rate  & 0xFFFF),
+        .cdw12      = (uint32_t)(jpeg_quality & 0xFF),
         .timeout_ms = NDP_NVME_TIMEOUT_MS,
     };
  
     printf("[NDP] Sending 0xC0 (data_len=%zu, cdw10=%u, sample_rate=1/%d, "
-           "scaler_sel=%d, jpeg_q=%d, cdw12=0x%08x) ...\n",
-           buf_bytes, ext.count, sample_rate, scaler_sel,
+           "jpeg_q=%d, cdw12=0x%08x) ...\n",
+           buf_bytes, ext.count, sample_rate,
            jpeg_quality ? jpeg_quality : 85, cdw12);
     fflush(stdout);
  
@@ -2800,7 +2929,7 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
      *   ([uint32 frame_count][uint32 jpeg_size × N][JPEG blob × N])
      */
     uint32_t total_result_size = 0;
-      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, 0, &total_result_size) < 0)
+      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, &total_result_size) < 0)
         goto cleanup_fd;
  
     if (total_result_size == 0) {
@@ -3007,48 +3136,62 @@ static void ndp_print_usage(const char *prog)
 "                      Default /dev/nvme1n1. Requires read/write permission.\n"
 "  -sample_rate <N>    Keep one frame out of every N. Sent to the target in\n"
 "                      cdw11. ndp_test defaults to 5, video_map to 1.\n"
+"  -thresh <f>         Confidence threshold. In ndp_test it controls which\n"
+"                      boxes are drawn; in video_map it applies to the\n"
+"                      precision/recall/F1 summary and to -save_img and\n"
+"                      -save_log. AP always integrates from 0.005.\n"
 "  -dont_show          Do not open any display window.\n"
 "\n"
 "video_map options\n"
 "  -labels <dir>       Ground-truth directory holding <frame>.txt files in\n"
 "                      YOLO format (class cx cy w h, normalised to the source\n"
 "                      resolution). Required.\n"
-"  -label_base <N>     Label file number for the first decoded frame.\n"
-"                      Default 1 (MOT-style datasets start at 000001).\n"
 "  -ndp                Evaluate the NDP pipeline. Without this flag the host\n"
 "                      baseline is evaluated instead.\n"
+"  -label_base <N>     Label file number for the first decoded frame.\n"
+"                      Default 1 (MOT-style datasets start at 000001).\n"
 "  -iou_thresh <f>     IoU threshold for the primary AP figure. Default 0.5.\n"
 "  -points <N>         Recall points for AP integration: 101 for COCO,\n"
 "                      11 for VOC 2007, 0 for area under the curve.\n"
 "  -coco_map           Additionally report mAP averaged over\n"
 "                      IoU = 0.50:0.05:0.95.\n"
-"  -thresh <f>         Confidence threshold for the precision/recall/F1\n"
-"                      summary only. Default 0.25. AP always integrates from\n"
-"                      0.005 and is unaffected.\n"
+"  -jpeg_q <N>         JPEG quality used by the target when re-encoding,\n"
+"                      1-100 in steps of 1. 0 uses the target default of 85.\n"
+"                      NDP mode only; forwarded in cdw12.\n"
 "\n"
-"Ablation options (NDP only, forwarded to the target in cdw12)\n"
-"  -scaler <N>         libswscale kernel used for downscaling on the target.\n"
-"                        0 BILINEAR (default)   1 POINT\n"
-"                        2 FAST_BILINEAR        3 BICUBIC\n"
-"                        4 AREA                 5 LANCZOS\n"
-"  -jpeg_q <N>         JPEG quality for re-encoding, 1-100. 0 uses the\n"
-"                      target default of 85.\n"
+"video_map output options\n"
+"  -save_img <dir>     Save one 416x416 image per evaluated frame with\n"
+"                      detections drawn in red and ground truth in green.\n"
+"                      Files are named frame_<NNNNNN>.jpg using the same\n"
+"                      numbering as the label files.\n"
+"  -save_log <file>    Write a CSV of per-frame records:\n"
+"                        frame,type,class_id,class_name,confidence,cx,cy,w,h\n"
+"                      type is 'det' or 'gt'. Coordinates are normalised to\n"
+"                      the source resolution, identical to the label format,\n"
+"                      so the log can be compared with the labels directly.\n"
 "\n"
 "Examples\n"
-"  # Host baseline, every frame, COCO-style mAP\n"
+"  # A: host baseline, every frame\n"
 "  %s detector video_map mot.data yolov7-tiny.cfg yolov7-tiny.weights \\\n"
-"      -file clip.mp4 -labels labels/clip -points 101 -coco_map -dont_show\n"
+"      -file clip.mp4 -labels labels/clip \\\n"
+"      -points 101 -coco_map -dont_show\n"
 "\n"
-"  # NDP pipeline, 1 frame in 5\n"
+"  # B: NDP, every frame\n"
 "  %s detector video_map mot.data yolov7-tiny.cfg yolov7-tiny.weights \\\n"
 "      -ndp -dev /dev/nvme1n1 -file /mnt/ext4/clip.mp4 -labels labels/clip \\\n"
-"      -sample_rate 5 -points 101 -coco_map -dont_show\n"
+"      -points 101 -coco_map -dont_show\n"
 "\n"
-"  # Ablation: nearest-neighbour scaling, lossless JPEG\n"
+"  # C: NDP, 1 frame in 5, with visual and CSV output\n"
 "  %s detector video_map mot.data yolov7-tiny.cfg yolov7-tiny.weights \\\n"
-"      -ndp -file /mnt/ext4/clip.mp4 -labels labels/clip \\\n"
-"      -sample_rate 5 -scaler 1 -jpeg_q 100 -points 101 -coco_map -dont_show\n"
-"\n", prog, prog, prog, prog, prog);
+"      -ndp -file /mnt/ext4/clip.mp4 -labels labels/clip -sample_rate 5 \\\n"
+"      -points 101 -coco_map -dont_show \\\n"
+"      -save_img out/C_img -save_log out/C_det.csv\n"
+"\n"
+"  # C-1: same as C but with a different JPEG quality\n"
+"  %s detector video_map mot.data yolov7-tiny.cfg yolov7-tiny.weights \\\n"
+"      -ndp -file /mnt/ext4/clip.mp4 -labels labels/clip -sample_rate 5 \\\n"
+"      -jpeg_q 60 -points 101 -coco_map -dont_show\n"
+"\n", prog, prog, prog, prog, prog, prog);
 }
 
 void run_detector(int argc, char **argv)
@@ -3153,15 +3296,16 @@ void run_detector(int argc, char **argv)
                           ndp_sample_rate);
     }
     else if (0 == strcmp(argv[2], "video_map")) {
-        char *nvme_dev    = find_char_arg(argc, argv, "-dev",    "/dev/nvme1n1");
-        char *video_path  = find_char_arg(argc, argv, "-file",   NULL);
-        char *label_dir   = find_char_arg(argc, argv, "-labels", NULL);
+        char *nvme_dev    = find_char_arg(argc, argv, "-dev",      "/dev/nvme1n1");
+        char *video_path  = find_char_arg(argc, argv, "-file",     NULL);
+        char *label_dir   = find_char_arg(argc, argv, "-labels",   NULL);
+        char *save_img    = find_char_arg(argc, argv, "-save_img", NULL);
+        char *save_log    = find_char_arg(argc, argv, "-save_log", NULL);
         int   use_ndp     = find_arg(argc, argv, "-ndp");
         int   sample_rate = find_int_arg(argc, argv, "-sample_rate", 1);
         int   label_base  = find_int_arg(argc, argv, "-label_base", 1);
         int   coco_range  = find_arg(argc, argv, "-coco_map");
-        /* 0 means "use whatever the target defaults to" */
-        int   scaler_sel  = find_int_arg(argc, argv, "-scaler", 0);
+        /* 0 이면 타겟 기본값(85) 사용 */
         int   jpeg_q      = find_int_arg(argc, argv, "-jpeg_q", 0);
         if (!video_path || !label_dir || find_arg(argc, argv, "-help")) {
             ndp_print_usage(argv[0]);
@@ -3170,7 +3314,7 @@ void run_detector(int argc, char **argv)
         validate_video_map(datacfg, cfg, weights, video_path, label_dir,
                            nvme_dev, use_ndp, sample_rate, label_base,
                            thresh, iou_thresh, map_points, coco_range,
-                           scaler_sel, jpeg_q);
+                           jpeg_q, save_img, save_log);
     }
     else if (0 == strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);
